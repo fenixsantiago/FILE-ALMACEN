@@ -21,18 +21,6 @@ st.set_page_config(page_title="ALMACEN CLIE", page_icon="📊", layout="wide")
 
 CARPETA = Path(__file__).resolve().parent
 DATOS_POR_DEFECTO = CARPETA / "datos_hoja1.csv.gz"   # copia rápida (se crea sola)
-NOMBRES_DATOS = ["datos_hoja1.csv.gz", "datos_hoja1_csv.gz", "datos_hoja1.csv"]
-
-
-def buscar_datos():
-    """Copia rápida de los datos (csv / csv.gz); tolera nombres con _ en vez de ."""
-    for nombre in NOMBRES_DATOS:
-        for carpeta in (CARPETA, Path.cwd()):
-            p = carpeta / nombre
-            if p.exists():
-                return p
-    return None
-
 
 def buscar_excel():
     """Busca ALMACER*.xlsx en la carpeta de la app, la carpeta padre, la carpeta
@@ -66,6 +54,11 @@ def limpiar(df: pd.DataFrame) -> pd.DataFrame:
     if len(idx) >= 2:
         cols[idx[0]], cols[idx[1]] = "TOTAL", "cantidad total"
     df.columns = cols
+    df = df.rename(columns={c: c.upper() for c in cols
+                            if c.upper() in ("NIT", "NOMBRE", "GRUPO", "PERIODO")})
+    faltan = [c for c in ("NIT", "NOMBRE", "GRUPO") if c not in df.columns]
+    if faltan:
+        raise ValueError(f"Faltan columnas {faltan}. Columnas encontradas: {list(df.columns)[:15]}")
     # Descartar filas vacías (la hoja trae ~1 millón de filas con formato)
     df = df.dropna(subset=["NOMBRE", "GRUPO"], how="all").dropna(how="all")
     df["NIT"] = df["NIT"].astype(str).str.replace(r"\.0$", "", regex=True)
@@ -76,37 +69,42 @@ def limpiar(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def leer_excel(origen) -> pd.DataFrame:
-    """Lee «Hoja1» fila por fila y se detiene al terminar los datos.
-    (La hoja trae ~1 millón de filas vacías; pandas.read_excel las cargaría todas
-    y en la nube se queda sin memoria.)"""
-    import openpyxl
-    wb = openpyxl.load_workbook(origen, read_only=True, data_only=True)
-    filas = wb["Hoja1"].iter_rows(values_only=True)
-    encabezado = next(filas)
-    i_nombre = [str(c).strip() if c else "" for c in encabezado].index("NOMBRE")
-    datos, vacias = [], 0
-    for fila in filas:
-        if fila[i_nombre] is None:
-            vacias += 1
-            if vacias >= 200:      # 200 filas vacías seguidas = fin de los datos
-                break
-            continue
-        vacias = 0
-        datos.append(fila)
-    wb.close()
-    return pd.DataFrame(datos, columns=encabezado)
+def _norm(c) -> str:
+    return " ".join(str(c).split()).upper()
+
+
+def leer_excel(archivo) -> pd.DataFrame:
+    """Busca, en todas las hojas, la fila de encabezados que contenga NOMBRE y
+    GRUPO (aunque no sea la fila 1 ni la hoja se llame «Hoja1») y lee desde ahí."""
+    def rebobinar():
+        if hasattr(archivo, "seek"):
+            archivo.seek(0)
+
+    rebobinar()
+    xl = pd.ExcelFile(archivo)
+    nombres = sorted(xl.sheet_names, key=lambda n: n.strip().lower() != "hoja1")
+    vistas = {}
+    for hoja in nombres:
+        muestra = xl.parse(hoja, header=None, nrows=30)
+        for i in range(len(muestra)):
+            fila = {_norm(v) for v in muestra.iloc[i].tolist()}
+            if any(x.startswith("NOMBRE") for x in fila) and "GRUPO" in fila:
+                rebobinar()
+                return pd.read_excel(archivo, sheet_name=hoja, header=i)
+        vistas[hoja] = [_norm(v) for v in muestra.iloc[0].tolist()] if len(muestra) else []
+    detalle = "; ".join(f"«{h}»: {c[:8]}" for h, c in vistas.items())
+    raise ValueError("No encontré columnas NOMBRE y GRUPO en ninguna hoja. "
+                     f"Primeras columnas por hoja → {detalle}")
 
 
 def hay_datos_locales() -> bool:
-    return buscar_datos() is not None or buscar_excel() is not None
+    return DATOS_POR_DEFECTO.exists() or buscar_excel() is not None
 
 
 @st.cache_data(show_spinner="Cargando datos…")
 def cargar_por_defecto() -> pd.DataFrame:
-    datos = buscar_datos()
-    if datos is not None:
-        return limpiar(pd.read_csv(datos, low_memory=False))
+    if DATOS_POR_DEFECTO.exists():
+        return limpiar(pd.read_csv(DATOS_POR_DEFECTO, low_memory=False))
     # Primera vez: leer el Excel y guardar una copia rápida para las siguientes
     df = limpiar(leer_excel(buscar_excel()))
     try:
@@ -160,7 +158,11 @@ with st.sidebar:
     st.caption("Sin archivo, la app busca ALMACER.xlsx sola.")
 
 if subido:
-    df = cargar_excel(subido)
+    try:
+        df = cargar_excel(subido)
+    except ValueError as e:
+        st.error(f"El archivo «{subido.name}» no tiene el formato esperado. {e}")
+        st.stop()
 elif hay_datos_locales():
     df = cargar_por_defecto()
 else:
